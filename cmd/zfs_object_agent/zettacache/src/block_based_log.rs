@@ -97,6 +97,19 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
         }
     }
 
+    pub fn reopen(
+        block_access: Arc<BlockAccess>,
+        extent_allocator: Arc<ExtentAllocator>,
+        phys: BlockBasedLogPhys,
+    ) -> BlockBasedLog<T> {
+        BlockBasedLog {
+            block_access,
+            extent_allocator,
+            phys,
+            pending_entries: Vec::new(),
+        }
+    }
+
     pub async fn flush(&mut self) -> BlockBasedLogPhys {
         self.flush_impl(|_, _, _| {}).await;
         self.phys.clone()
