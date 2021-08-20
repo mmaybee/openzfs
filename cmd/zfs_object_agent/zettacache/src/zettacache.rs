@@ -83,7 +83,7 @@ struct ZettaCheckpointPhys {
     index: ZettaCacheIndexPhys,
     chunk_summary: BlockBasedLogPhys,
     operation_log: BlockBasedLogPhys,
-    merging_operation_log: BlockBasedLogPhys,
+    merging_operation_log: Option<BlockBasedLogPhys>,
 }
 
 impl ZettaCheckpointPhys {
@@ -525,12 +525,6 @@ impl ZettaCache {
             checkpoint.operation_log,
         );
 
-        let merge_operation_log = BlockBasedLog::open(
-            block_access.clone(),
-            extent_allocator.clone(),
-            checkpoint.merging_operation_log.clone(),
-        );
-
         let index = ZettaCacheIndex::open(
             block_access.clone(),
             extent_allocator.clone(),
@@ -545,17 +539,22 @@ impl ZettaCache {
         debug!("atime_histogram: {:#?}", atime_histogram);
 
         // If we had a merge in progress, reconstruct the merging state and update the atime histogram
-        let merging_state = if merge_operation_log.is_empty() {
-            None
-        } else {
-            let (pending_changes, total_histogram) =
-                Self::load_operation_log(&merge_operation_log, &atime_histogram).await;
-            let ms: Arc<MergeState> = Arc::new(MergeState {
-                pending_changes,
-                operation_log_phys: checkpoint.merging_operation_log,
-            });
-            atime_histogram = total_histogram;
-            Some(ms)
+        let merging_state = match checkpoint.merging_operation_log {
+            Some(operation_log_phys) => {
+                let merge_operation_log = BlockBasedLog::open(
+                    block_access.clone(),
+                    extent_allocator.clone(),
+                    operation_log_phys.clone(),
+                );
+                let (pending_changes, total_histogram) =
+                    Self::load_operation_log(&merge_operation_log, &atime_histogram).await;
+                atime_histogram = total_histogram;
+                Some(Arc::new(MergeState {
+                    pending_changes,
+                    operation_log_phys,
+                }))
+            }
+            None => None,
         };
 
         let state = ZettaCacheState {
@@ -1199,18 +1198,16 @@ impl ZettaCacheState {
         )
         .await;
 
-        let merging_operation_log_phys = match &self.merging_state {
-            Some(ms) => ms.operation_log_phys.clone(),
-            None => Default::default(),
-        };
-
         let checkpoint = ZettaCheckpointPhys {
             generation: self.super_phys.last_checkpoint_id.next(),
             extent_allocator: self.extent_allocator.get_phys(),
             index: index_phys,
             chunk_summary: chunk_summary_phys,
             operation_log: operation_log_phys,
-            merging_operation_log: merging_operation_log_phys,
+            merging_operation_log: self
+                .merging_state
+                .as_ref()
+                .map(|ms| ms.operation_log_phys.clone()),
             last_atime: self.atime,
             block_allocator: self.block_allocator.flush().await,
         };
@@ -1291,17 +1288,14 @@ impl ZettaCacheState {
             return Some((merging_state, new_index));
         }
 
-        let pending_changes = self.pending_changes.clone();
-        let operation_log_phys = self.operation_log.flush().await;
         let new_state: Arc<MergeState> = Arc::new(MergeState {
-            pending_changes,
-            operation_log_phys,
+            pending_changes: std::mem::take(&mut self.pending_changes),
+            operation_log_phys: self.operation_log.flush().await,
         });
 
         // Set up state with current pending changes and operation log in the new merging state
         // and pending changes and operation log now cleared in the state
         self.merging_state = Some(new_state.clone());
-        self.pending_changes = BTreeMap::new(); // XXX - can I just clear() here?
         self.operation_log = BlockBasedLog::open(
             self.block_access.clone(),
             self.extent_allocator.clone(),
