@@ -1184,12 +1184,6 @@ impl ZettaCacheState {
         if let Some(m) = msg {
             info!("sync with merge: {}", m.unwrap());
         }
-        //if self.pending_changes.len() > *MAX_PENDING_CHANGES {
-        //    index.flush().await;
-        //    let new_index = self.merge_pending_changes(index).await;
-        //    index.clear();
-        //    *index = new_index;
-        //}
 
         let (index_phys, chunk_summary_phys, operation_log_phys) = future::join3(
             index.flush(),
@@ -1257,7 +1251,7 @@ impl ZettaCacheState {
     }
 
     async fn get_merge_state(&mut self) -> Option<(Arc<MergeState>, ZettaCacheIndex)> {
-        // Check to see if there is any state avaliable to merge
+        // Check to see if there is any state available to merge
         if self.merging_state.is_none() && self.pending_changes.is_empty() {
             return None;
         }
@@ -1316,11 +1310,10 @@ impl ZettaCacheState {
         debug!("freeing {} blocks", free_list.len());
         for entry in free_list {
             self.pending_changes.remove(&entry.key);
-            let extent = Extent {
+            self.block_allocator.free(&Extent {
                 location: entry.value.location,
                 size: entry.value.size,
-            };
-            self.block_allocator.free(&extent);
+            });
         }
 
         // Free up the extents that have been allocated for the merge pending state
