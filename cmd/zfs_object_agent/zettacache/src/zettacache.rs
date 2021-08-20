@@ -773,37 +773,17 @@ impl ZettaCache {
                 }
                 None => {
                     // No pending change in current state; need to look in merging state
-                    match &state.merging_state {
-                        Some(ms) => {
-                            match ms.pending_changes.get(&key).copied() {
-                                Some(pc) => {
-                                    match pc {
-                                        PendingChange::Insert(value) => {
-                                            Some(state.lookup(key, value))
-                                        }
-                                        PendingChange::RemoveThenInsert(value) => {
-                                            Some(state.lookup(key, value))
-                                        }
-                                        PendingChange::UpdateAtime(value) => {
-                                            Some(state.lookup(key, value))
-                                        }
-                                        PendingChange::Remove() => {
-                                            // Pending change says this has been removed
-                                            Some(data_reader_none())
-                                        }
-                                    }
-                                }
-                                None => {
-                                    // No pending change; need to look in index
-                                    None
-                                }
+                    state.merging_state.clone().and_then(|ms| {
+                        ms.pending_changes.get(&key).copied().map(|pc| match pc {
+                            PendingChange::Insert(value) => state.lookup(key, value),
+                            PendingChange::RemoveThenInsert(value) => state.lookup(key, value),
+                            PendingChange::UpdateAtime(value) => state.lookup(key, value),
+                            PendingChange::Remove() => {
+                                // Pending change says this has been removed
+                                data_reader_none()
                             }
-                        }
-                        None => {
-                            // No current merging state; need to look in index
-                            None
-                        }
-                    }
+                        })
+                    })
                 }
             }
         };
@@ -874,20 +854,19 @@ impl ZettaCache {
             let merging_state = self.state.lock().await.get_merge_state().await;
 
             // Bail if there is nothing to merge
-            if merging_state.is_none() {
-                trace!("nothing to merge in this cycle");
-                interval.tick().await;
-                continue;
-            }
+            let (ms, mut new_index) = match merging_state {
+                Some(merging_state) => merging_state,
+                None => {
+                    trace!("nothing to merge in this cycle");
+                    interval.tick().await;
+                    continue;
+                }
+            };
 
             // Now merge the pending state into the index with only the read lock.
             // This constructs a new index and returns a list of blocks freed due to eviction.
-            let (ms, mut new_index) = merging_state.unwrap();
             let index = self.index.read().await;
-            let free_list = ms
-                .unwrap()
-                .merge_pending_state(&index, &mut new_index)
-                .await;
+            let free_list = ms.merge_pending_state(&index, &mut new_index).await;
             drop(index);
 
             // Finally, sync the new index and pending state with write lock and state mutex
@@ -1280,7 +1259,7 @@ impl ZettaCacheState {
         );
     }
 
-    async fn get_merge_state(&mut self) -> Option<(Option<Arc<MergeState>>, ZettaCacheIndex)> {
+    async fn get_merge_state(&mut self) -> Option<(Arc<MergeState>, ZettaCacheIndex)> {
         // Check to see if there is any state avaliable to merge
         if self.merging_state.is_none() && self.pending_changes.is_empty() {
             return None;
@@ -1308,8 +1287,8 @@ impl ZettaCacheState {
         // If we already have a merging state, this must have come from a checkpoint
         // state with an active merge. Go ahead and use this recovered state rather
         // than pulling the current pending state.
-        if self.merging_state.is_some() {
-            return Some((self.merging_state.clone(), new_index));
+        if let Some(merging_state) = self.merging_state.as_ref().cloned() {
+            return Some((merging_state, new_index));
         }
 
         let pending_changes = self.pending_changes.clone();
@@ -1321,7 +1300,7 @@ impl ZettaCacheState {
 
         // Set up state with current pending changes and operation log in the new merging state
         // and pending changes and operation log now cleared in the state
-        self.merging_state = Some(new_state);
+        self.merging_state = Some(new_state.clone());
         self.pending_changes = BTreeMap::new(); // XXX - can I just clear() here?
         self.operation_log = BlockBasedLog::open(
             self.block_access.clone(),
@@ -1329,7 +1308,7 @@ impl ZettaCacheState {
             Default::default(),
         );
 
-        Some((self.merging_state.clone(), new_index))
+        Some((new_state, new_index))
     }
 
     async fn sync_merge_state(
